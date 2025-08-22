@@ -140,7 +140,10 @@ public class Statistic {
             // Không đổi round → heartbeat / stall warn
             heartbeat();
         }
+<<<<<<< HEAD:src/main/java/view/Statistic.java
         
+=======
+>>>>>>> 0ccb6f8087256935d3528975dfa07bfe9f263354:src/main/java/controller/Statistic.java
         printSummary();
     }
 
