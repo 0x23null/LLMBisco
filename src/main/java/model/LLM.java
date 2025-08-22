@@ -51,15 +51,15 @@ public class LLM {
             // Với response_mime_type=application/json, phần text này CHÍNH LÀ JSON output.
             String text = extractFirstText(body);
             if (text == null || text.isBlank()) {
-                System.err.println("[ERR ] LLM response text is empty or null.");
+                //System.err.println("[ERR ] LLM response text is empty or null.");
                 //return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"Empty LLM text\"}";
             }
             return text.trim();
         } catch (HttpTimeoutException te) {
-            System.err.println("[ERR ] LLM HTTP timeout: " + te.getMessage());
+            //System.err.println("[ERR ] LLM HTTP timeout: " + te.getMessage());
             return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"LLM timeout\"}";
         } catch (Exception e) {
-            System.err.println("[ERR ] LLM general error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            //System.err.println("[ERR ] LLM general error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"LLM error: " + escapeForJson(e.getMessage()) + "\"}";
         }
     }
