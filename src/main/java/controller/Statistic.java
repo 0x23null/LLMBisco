@@ -40,6 +40,9 @@ public class Statistic {
     private final Double stakeCap = null;      // null = không giới hạn
     private final Bankroll bankroll = new Bankroll(baseBet, multiplier, stakeCap);
 
+    // ===== GIỚI HẠN SỐ VÁN =====
+    private final int maxRounds;
+
     // ===== THỐNG KÊ / LOG =====
     private int settledRounds = 0;       // số ván đã settle (đã có actual)
     private int correctOnBets = 0;       // số ván đúng trên các ván CÓ đặt (không tính SKIP)
@@ -53,6 +56,14 @@ public class Statistic {
 
     // Regex: "pick": "TAI|XIU|SKIP"
     private static final Pattern PICK_RE = Pattern.compile("\"pick\"\\s*:\\s*\"\\s*(TAI|XIU|SKIP)\\s*\"", Pattern.CASE_INSENSITIVE);
+
+    public Statistic() {
+        this(10);
+    }
+
+    public Statistic(int maxRounds) {
+        this.maxRounds = maxRounds;
+    }
 
     public void run() {
         // Start scanner đúng 1 lần
@@ -110,6 +121,9 @@ public class Statistic {
                     settledRounds++;
                     settleAndReport(candidateHistory, pendingPred, actual);
                     pendingPred = null;
+                    if (settledRounds >= maxRounds) {
+                        break;
+                    }
                 }
 
                 // 2) NEW PRED cho ván kế tiếp, dùng lịch sử hiện tại
@@ -125,6 +139,8 @@ public class Statistic {
             // Không đổi round → heartbeat / stall warn
             heartbeat();
         }
+        }
+        printSummary();
     }
 
     // ======= SETTLE & REPORT =======
@@ -170,18 +186,28 @@ public class Statistic {
 
         int roundsBet = bankroll.getRoundsBet();
         double accBets = (roundsBet == 0) ? 0.0 : (double) correctOnBets / roundsBet;
+        boolean win = (pred == Pred.TAI && actual == Actual.T) || (pred == Pred.XIU && actual == Actual.X);
+        String result = (pred == Pred.SKIP) ? "SKIP" : (win ? "WIN" : "LOSE");
 
-        System.out.printf("[%s] SETTLE  | hist=%s | pred_prev=%s actual=%s | settled=%d bet=%d acc(bet)=%.2f%% | %s%n",
-                nowStr(), history, pred, actual, settledRounds, roundsBet, accBets * 100.0, bankroll.summary());
+        System.out.printf("[%s] Round=%d | pred=%s actual=%s result=%s | acc=%.2f%% | pnl=%.2f | nextStake=%.2f%n",
+                nowStr(), settledRounds, pred, actual, result, accBets * 100.0,
+                bankroll.getProfit(), bankroll.getCurrentStake());
+    }
 
-        if (settledRounds % 10 == 0) {
-            System.out.printf("Confusion: TAI->T:%d TAI->X:%d | XIU->X:%d XIU->T:%d | SKIP->T:%d SKIP->X:%d%n",
-                    pTAI_aT, pTAI_aX, pXIU_aX, pXIU_aT, pSKIP_aT, pSKIP_aX);
-            System.out.printf("Heuristic Fallback: Used=%d Correct=%d (Accuracy=%.2f%%)%n",
-                    heuristicFallbackUsedCount, heuristicFallbackCorrectCount,
-                    (heuristicFallbackUsedCount == 0) ? 0.0
-                            : (double) heuristicFallbackCorrectCount / heuristicFallbackUsedCount * 100.0);
-        }
+    private void printSummary() {
+        int roundsBet = bankroll.getRoundsBet();
+        double accBets = (roundsBet == 0) ? 0.0 : (double) correctOnBets / roundsBet * 100.0;
+        System.out.println("\n===== SUMMARY =====");
+        System.out.printf("Rounds settled: %d%n", settledRounds);
+        System.out.printf("Bets placed: %d%n", roundsBet);
+        System.out.printf("Accuracy on bets: %.2f%%%n", accBets);
+        System.out.println(bankroll.summary());
+        System.out.printf("Confusion: TAI->T:%d TAI->X:%d | XIU->X:%d XIU->T:%d | SKIP->T:%d SKIP->X:%d%n",
+                pTAI_aT, pTAI_aX, pXIU_aX, pXIU_aT, pSKIP_aT, pSKIP_aX);
+        System.out.printf("Heuristic Fallback: Used=%d Correct=%d (Accuracy=%.2f%%)%n",
+                heuristicFallbackUsedCount, heuristicFallbackCorrectCount,
+                (heuristicFallbackUsedCount == 0) ? 0.0
+                        : (double) heuristicFallbackCorrectCount / heuristicFallbackUsedCount * 100.0);
     }
 
     // ======= LLM CALL (TIMEOUT + PARSER CỨNG + CHỐNG SKIP) =======
@@ -398,6 +424,10 @@ public class Statistic {
 
         public double getROI() {
             return (roundsBet == 0) ? 0.0 : (profit / (roundsBet * baseBet));
+        }
+
+        public double getProfit() {
+            return profit;
         }
 
         public double requiredCapitalByLongestL() {
