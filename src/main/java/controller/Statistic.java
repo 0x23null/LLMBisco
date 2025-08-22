@@ -12,100 +12,117 @@ import model.LLM;
 
 public class Statistic {
 
-    // ===== GIỮ NGUYÊN TỌA ĐỘ CỦA BẠN =====
+    // ===== GIỮ NGUYÊN TOẠ ĐỘ + SCALE CỦA BẠN =====
     private final Point first = new Point(408, 591);
-    private final Point last = new Point(880, 590);
+    private final Point last  = new Point(880, 590);
     private final double screenScale = 1.0;
 
-    // Poll mỗi 2s
-    private final long pollIntervalMs = 2000;
+    // ===== NHỊP & GIÁM SÁT =====
+    private final long pollIntervalMs  = 2000;   // quét mỗi 2s
+    private final long heartbeatMs     = 10_000; // in heartbeat mỗi 10s khi chờ
+    private final long stallWarnMs     = 90_000; // >90s không thấy round close -> cảnh báo
 
-    // Bankroll (gấp thếp)
-    private final double baseBet = 3.0;
-    private final double multiplier = 2.0;
-    private final Double stakeCap = null; // null = no cap
+    // ===== STABILITY WINDOW (K lần đọc giống hệt) =====
+    private final int requiredStable   = 2;      // K=2 là "đủ mượt"; có thể đổi 3 nếu UI nháy nhiều
+    private String prevHistory         = null;   // lịch sử đã XÁC NHẬN gần nhất
+    private String candidateHistory    = null;   // ứng viên lịch sử đang ổn định
+    private int stableCount            = 0;      // số lần thấy liên tiếp candidateHistory
 
-    // Runtime
-    private final DotScannerService scan = new DotScannerService(first, last, screenScale);
+    // ===== LLM & PREDICTION =====
     private final LLM llm = new LLM();
+    private Pred pendingPred           = null;   // kèo đã "đặt" cho ván đang chạy, sẽ settle khi close
+    private final boolean enableRetryOnSkip      = true;   // thử gọi lại 1 lần nếu ra SKIP
+    private final boolean enableHeuristicFallback = false; // fallback local khi vẫn SKIP (mặc định tắt)
+
+    // ===== BANKROLL (MARTINGALE) =====
+    private final double baseBet    = 3.0;       // cược gốc (bạn đổi được)
+    private final double multiplier = 2.0;       // x2 (đổi 3.0 nếu muốn x3)
+    private final Double stakeCap   = null;      // null = không giới hạn
     private final Bankroll bankroll = new Bankroll(baseBet, multiplier, stakeCap);
 
-    private Character lastResolvedChar = null; // kết quả của ván đã đóng gần nhất
-    private Pred pendingPred = null;           // kèo đã “đặt” cho ván đang chạy, chờ settle
+    // ===== THỐNG KÊ / LOG =====
+    private int settledRounds = 0;       // số ván đã settle (đã có actual)
+    private int correctOnBets = 0;       // số ván đúng trên các ván CÓ đặt (không tính SKIP)
+    private int pTAI_aT = 0, pTAI_aX = 0, pXIU_aX = 0, pXIU_aT = 0, pSKIP_aT = 0, pSKIP_aX = 0;
 
-    private int settledRounds = 0;   // số ván đã settle (đã có actual)
-    private int correctOnBets = 0;   // số đúng trong các ván CÓ đặt (bỏ qua SKIP)
-
-    // confusion[pred][actual]
-    private final int[][] confusion = new int[Pred.values().length][Actual.values().length];
-
+    private long lastHeartbeatAtMs = 0L;
+    private long lastChangeAtMs    = 0L;
     private final DateTimeFormatter tsFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    // Regex: "pick": "TAI|XIU|SKIP"
     private static final Pattern PICK_RE = Pattern.compile("\"pick\"\\s*:\\s*\"\\s*(TAI|XIU|SKIP)\\s*\"", Pattern.CASE_INSENSITIVE);
 
-    // Heartbeat & stall
-    private long lastHeartbeatAtMs = 0L;
-    private final long heartbeatMs = 10_000;
-    private long lastChangeAtMs = 0L;
-    private final long stallWarnMs = 90_000;
-
     public void run() {
+        // Start scanner đúng 1 lần
+        DotScannerService scan = new DotScannerService(first, last, screenScale);
         scan.start();
-        log("[INFO] Statistic started. Poll=" + pollIntervalMs + "ms");
+        log("[INFO] Statistic started. Poll=" + pollIntervalMs + "ms, requiredStable=" + requiredStable);
 
         while (true) {
-            try {
-                Thread.sleep(pollIntervalMs);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                log("[ERR ] loop interrupted");
-                break;
-            }
+            try { Thread.sleep(pollIntervalMs); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); log("[ERR ] loop interrupted"); break; }
 
             String history = scan.getLastHistory();
-            if (history == null || history.length() < 13) {
-                heartbeat();
-                continue;
+            if (history == null || history.length() < 13) { heartbeat(); continue; }
+
+            // === STABILITY WINDOW ===
+            if (!history.equals(candidateHistory)) {
+                candidateHistory = history;
+                stableCount = 1;
+                //log("[DBG ] candidate changed; reset stableCount=1");
+            } else {
+                stableCount++;
+                //log("[DBG ] stableCount=" + stableCount + "/" + requiredStable);
             }
 
-            char lastChar = history.charAt(history.length() - 1);
+            if (stableCount < requiredStable) { heartbeat(); continue; }
+            // Tới đây: candidateHistory đã ổn định đủ K lần
+            boolean firstConfirm = (prevHistory == null);
+            boolean closed = !firstConfirm && !candidateHistory.equals(prevHistory);
 
-            // VÁN ĐÓNG khi lastChar đổi so với lastResolvedChar
-            if (lastResolvedChar == null || lastChar != lastResolvedChar) {
-                // 1) SETTLE kèo cũ nếu có
-                if (lastResolvedChar != null && pendingPred != null) {
-                    Actual actual = (lastChar == 'T') ? Actual.T : Actual.X; // actual của ván vừa đóng
-                    settledRounds++;
-                    settleAndReport(history, pendingPred, actual); // cập nhật bankroll + confusion + log
-                    pendingPred = null; // kèo đã được settle
-                }
-
-                // 2) Lấy kèo mới cho ván kế tiếp (dùng history hiện tại sau khi đã có actual mới)
-                Pred nextPred = callLLMForPick(history);
-                pendingPred = nextPred;
-
-                System.out.printf("[%s] NEW PRED | hist=%s | pred_next=%s | nextStake=%.2f%n",
-                        nowStr(), history, pendingPred, bankroll.getCurrentStake());
-
-                lastResolvedChar = lastChar;
+            if (firstConfirm) {
+                // Lần đầu có lịch sử ổn định: chưa settle gì, chỉ xin kèo cho ván kế tiếp
+                pendingPred = callLLMForPick(candidateHistory);
+                System.out.printf("[%s] NEW SESS | hist=%s | pred_next=%s | nextStake=%.2f%n",
+                        nowStr(), candidateHistory, pendingPred, bankroll.getCurrentStake());
+                prevHistory = candidateHistory;
                 lastChangeAtMs = System.currentTimeMillis();
                 continue;
             }
 
-            // Không có ván mới → heartbeat / stall warning
+            if (closed) {
+                // 1) SETTLE kèo cũ với actual = ký tự cuối của lịch sử đã ổn định mới
+                Actual actual = (candidateHistory.charAt(candidateHistory.length() - 1) == 'T') ? Actual.T : Actual.X;
+                if (pendingPred != null) {
+                    settledRounds++;
+                    settleAndReport(candidateHistory, pendingPred, actual);
+                    pendingPred = null;
+                }
+
+                // 2) NEW PRED cho ván kế tiếp, dùng lịch sử hiện tại
+                pendingPred = callLLMForPick(candidateHistory);
+                System.out.printf("[%s] NEW SESS | hist=%s | pred_next=%s | nextStake=%.2f%n",
+                        nowStr(), candidateHistory, pendingPred, bankroll.getCurrentStake());
+
+                prevHistory = candidateHistory;
+                lastChangeAtMs = System.currentTimeMillis();
+                continue;
+            }
+
+            // Không đổi round → heartbeat / stall warn
             heartbeat();
         }
     }
 
+    // ======= SETTLE & REPORT =======
     private void settleAndReport(String history, Pred pred, Actual actual) {
-        // confusion + correct
-        confusion[pred.ordinal()][actual.ordinal()]++;
-        if (pred != Pred.SKIP) {
-            if ((pred == Pred.TAI && actual == Actual.T) || (pred == Pred.XIU && actual == Actual.X)) {
-                correctOnBets++;
-            }
+        switch (pred) {
+            case TAI -> { if (actual == Actual.T) { pTAI_aT++; correctOnBets++; } else { pTAI_aX++; } }
+            case XIU -> { if (actual == Actual.X) { pXIU_aX++; correctOnBets++; } else { pXIU_aT++; } }
+            case SKIP -> { if (actual == Actual.T) pSKIP_aT++; else pSKIP_aX++; }
         }
 
-        // bankroll (SKIP = không cược)
+        // Bankroll: SKIP = không cược
         bankroll.onRound(
                 (pred == Pred.SKIP) ? Bankroll.Pred.SKIP
                         : (pred == Pred.TAI ? Bankroll.Pred.TAI : Bankroll.Pred.XIU),
@@ -120,26 +137,30 @@ public class Statistic {
 
         if (settledRounds % 10 == 0) {
             System.out.printf("Confusion: TAI->T:%d TAI->X:%d | XIU->X:%d XIU->T:%d | SKIP->T:%d SKIP->X:%d%n",
-                    confusion[Pred.TAI.ordinal()][Actual.T.ordinal()],
-                    confusion[Pred.TAI.ordinal()][Actual.X.ordinal()],
-                    confusion[Pred.XIU.ordinal()][Actual.X.ordinal()],
-                    confusion[Pred.XIU.ordinal()][Actual.T.ordinal()],
-                    confusion[Pred.SKIP.ordinal()][Actual.T.ordinal()],
-                    confusion[Pred.SKIP.ordinal()][Actual.X.ordinal()]);
+                    pTAI_aT, pTAI_aX, pXIU_aX, pXIU_aT, pSKIP_aT, pSKIP_aX);
         }
     }
 
+    // ======= LLM CALL (TIMEOUT + PARSER CỨNG + CHỐNG SKIP) =======
     private Pred callLLMForPick(String history) {
         String inputJson = "{\"history\":\"" + history + "\"}";
-        System.out.println("[DBG ] calling LLM for next pick...");
-        String raw = safeCallLLM(inputJson);           // có timeout cứng
-        String jsonOnly = extractJsonObject(raw);
-        Pred pred = parsePick(jsonOnly);
-        System.out.println("[DBG ] LLM returned pick=" + pred);
+        String raw = safeCallLLM(inputJson);
+        Pred pred = parsePick(extractJsonObject(raw));
+
+        if (pred == Pred.SKIP && enableRetryOnSkip) {
+            // Retry 1 lần với “hint” (không đổi API): thêm nhãn RETRY để tách ngữ cảnh
+            String raw2 = safeCallLLM(inputJson + " RETRY");
+            pred = parsePick(extractJsonObject(raw2));
+        }
+        if (pred == Pred.SKIP && enableHeuristicFallback) {
+            Pred h = heuristicFallback(history);
+            System.out.println("[DBG ] heuristic fallback -> " + h);
+            pred = h;
+        }
         return pred;
     }
 
-    // Timeout cứng 12s để không bao giờ treo vòng lặp
+    // Timeout cứng: 12s. Không để vòng lặp bị kẹt.
     private String safeCallLLM(String json) {
         try {
             return CompletableFuture
@@ -151,7 +172,50 @@ public class Statistic {
         }
     }
 
-    // Heartbeat + stall warning
+    // Trích phần JSON {...} đầu tiên; nếu không có thì trả raw.trim()
+    private String extractJsonObject(String s) {
+        if (s == null) return "{\"pick\":\"SKIP\"}";
+        int l = s.indexOf('{'), r = s.lastIndexOf('}');
+        if (l >= 0 && r > l) return s.substring(l, r + 1);
+        return s.trim();
+    }
+
+    // Parser: JSON -> "pick", fallback keyword
+    private Pred parsePick(String responseJson) {
+        if (responseJson == null) return Pred.SKIP;
+        Matcher m = PICK_RE.matcher(responseJson);
+        if (m.find()) return toPred(m.group(1));
+
+        // Fallback: tìm khóa "pick":"...":
+        int k = responseJson.toLowerCase().indexOf("\"pick\"");
+        if (k >= 0) {
+            int q1 = responseJson.indexOf('"', k + 6);
+            int q2 = (q1 >= 0) ? responseJson.indexOf('"', q1 + 1) : -1;
+            if (q2 > q1) return toPred(responseJson.substring(q1 + 1, q2));
+        }
+
+        // Siêu fallback: quét từ khoá
+        String up = responseJson.toUpperCase();
+        if (up.contains("TAI")) return Pred.TAI;
+        if (up.contains("XIU")) return Pred.XIU;
+        if (up.contains("SKIP")) return Pred.SKIP;
+        return Pred.SKIP;
+    }
+
+    private Pred toPred(String x) {
+        String t = (x == null) ? "" : x.trim().toUpperCase();
+        return switch (t) { case "TAI" -> Pred.TAI; case "XIU" -> Pred.XIU; default -> Pred.SKIP; };
+    }
+
+    // Heuristic optional: majority 13; tie -> anti-run theo last char
+    private Pred heuristicFallback(String history) {
+        int t=0,x=0; for (char c: history.toCharArray()) if (c=='T') t++; else if (c=='X') x++;
+        if (t != x) return (t > x) ? Pred.TAI : Pred.XIU;
+        char last = history.charAt(history.length()-1);
+        return (last=='T') ? Pred.XIU : Pred.TAI;
+    }
+
+    // ======= HEARTBEAT / STALL =======
     private void heartbeat() {
         long now = System.currentTimeMillis();
         if (now - lastHeartbeatAtMs >= heartbeatMs) {
@@ -159,67 +223,74 @@ public class Statistic {
             System.out.println("[HB  ] alive; waiting round close...");
         }
         if (lastChangeAtMs > 0 && now - lastChangeAtMs >= stallWarnMs) {
-            System.out.println("[WARN] >90s không thấy round close. Kiểm tra tọa độ/scale/khu vực hiển thị.");
-            lastChangeAtMs = now; // tránh spam cảnh báo
+            System.out.println("[WARN] >90s no round close detected. Check scanning region/scale/visibility.");
+            lastChangeAtMs = now; // tránh spam
         }
     }
 
-    // ===== JSON helpers =====
-    private String extractJsonObject(String s) {
-        if (s == null) {
-            return "{\"pick\":\"SKIP\"}";
-        }
-        int l = s.indexOf('{'), r = s.lastIndexOf('}');
-        if (l >= 0 && r > l) {
-            return s.substring(l, r + 1);
-        }
-        return s.trim();
-    }
+    // ======= UTILS =======
+    private String nowStr() { return LocalDateTime.now().format(tsFmt); }
+    private void log(String s) { System.out.println(s); }
 
-    private Pred parsePick(String responseJson) {
-        if (responseJson == null) {
-            return Pred.SKIP;
-        }
-        Matcher m = PICK_RE.matcher(responseJson);
-        if (m.find()) {
-            String pick = m.group(1).toUpperCase();
-            return switch (pick) {
-                case "TAI" ->
-                    Pred.TAI;
-                case "XIU" ->
-                    Pred.XIU;
-                default ->
-                    Pred.SKIP;
-            };
-        }
-        String up = responseJson.toUpperCase();
-        if (up.contains("TAI")) {
-            return Pred.TAI;
-        }
-        if (up.contains("XIU")) {
-            return Pred.XIU;
-        }
-        if (up.contains("SKIP")) {
-            return Pred.SKIP;
-        }
-        return Pred.SKIP;
-    }
+    // ======= ENUMS =======
+    private enum Pred { TAI, XIU, SKIP }
+    private enum Actual { T, X }
 
-    private String nowStr() {
-        return LocalDateTime.now().format(tsFmt);
-    }
+    // ======= BANKROLL (MARTINGALE) =======
+    public static class Bankroll {
+        private final double baseBet, multiplier; private final Double stakeCap;
+        private double stake, profit, maxStake, peakProfit, maxDrawdown;
+        private int roundsBet, losingStreak, longestLosingStreak, resets;
 
-    private void log(String s) {
-        System.out.println(s);
-    }
+        public Bankroll(double baseBet, double multiplier, Double stakeCap) {
+            if (baseBet <= 0 || multiplier <= 1.0)
+                throw new IllegalArgumentException("baseBet>0 & multiplier>1.0");
+            this.baseBet = baseBet; this.multiplier = multiplier; this.stakeCap = stakeCap;
+            this.stake = baseBet;
+        }
 
-    // ===== Enums =====
-    private enum Pred {
-        TAI, XIU, SKIP
-    }
+        public enum Pred { TAI, XIU, SKIP }
+        public enum Actual { T, X }
 
-    private enum Actual {
-        T, X
-    }
+        public void onRound(Pred prediction, Actual actual) {
+            if (prediction == Pred.SKIP) return; // không đặt thì không ghi nhận
+            roundsBet++;
+            boolean win = (prediction == Pred.TAI && actual == Actual.T)
+                       || (prediction == Pred.XIU && actual == Actual.X);
+            if (win) {
+                profit += stake;
+                losingStreak = 0;
+                stake = baseBet;
+            } else {
+                profit -= stake;
+                losingStreak++;
+                longestLosingStreak = Math.max(longestLosingStreak, losingStreak);
+                stake *= multiplier;
+                if (stakeCap != null && stake > stakeCap) {
+                    stake = baseBet;
+                    resets++;
+                }
+            }
+            if (profit > peakProfit) peakProfit = profit;
+            maxDrawdown = Math.max(maxDrawdown, peakProfit - profit);
+            maxStake = Math.max(maxStake, stake);
+        }
 
+        public int getRoundsBet() { return roundsBet; }
+        public double getCurrentStake() { return stake; }
+        public double getROI() { return (roundsBet == 0) ? 0.0 : (profit / (roundsBet * baseBet)); }
+
+        public double requiredCapitalByLongestL() {
+            int L = Math.max(1, longestLosingStreak);
+            return (multiplier == 1.0) ? baseBet * L
+                    : baseBet * (Math.pow(multiplier, L) - 1.0) / (multiplier - 1.0);
+        }
+
+        public String summary() {
+            return String.format(
+                "PnL=%.2f | ROI=%.2f%% | roundsBet=%d | longestL=%d | maxStake=%.2f | MDD=%.2f | resets=%d | nextStake=%.2f | requiredCapital(LLS)=%.2f",
+                profit, getROI()*100.0, roundsBet, longestLosingStreak, maxStake, maxDrawdown, resets, stake, requiredCapitalByLongestL()
+            );
+        }
+    }
 }

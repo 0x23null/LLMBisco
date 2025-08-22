@@ -1,83 +1,251 @@
 package model;
 
-import com.google.genai.Client;
-import com.google.genai.types.GenerateContentResponse;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpTimeoutException;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 
 public class LLM {
-    private static final Client CLIENT = Client.builder()
-            .apiKey(System.getenv().getOrDefault("GENAI_API_KEY", "AIzaSyCSeJkWCGwwX-BABEMS7yYpkVSZMBqhJ-U"))
-            .build();
 
-    private static final String CONTEXT = """
-                     ROLE
-                     You are a cold, rational analyst for a dice-based Tài/Xỉu game that may be manipulated.
-                     Input will always be exactly 13 most recent results, with "T" meaning Tài and "X" meaning Xỉu.
-                     Your only task is to output one of {TAI, XIU, SKIP} based strictly on pattern analysis.
+    // ===== Config =====
+    private static final String MODEL = "gemini-2.5-flash";
+    private static final String ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/"
+            + MODEL + ":generateContent?key=";
 
-                     INPUT FORMAT
-                     The user will provide a JSON object:
-                     {
-                       "history": "string of 13 characters over {T,X}, oldest to newest, newest is the last character"
-                     }
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(8);
+    private static final Duration CALL_TIMEOUT = Duration.ofSeconds(12);
 
-                     ANALYSIS PROCEDURE
-                     1. Identify the last run: the symbol of the last streak and its length.
-                     2. Identify the previous run: the symbol and length of the streak immediately before the last run.
-                     3. Calculate proportions of T and X in the entire 13-game history.
-                     4. Calculate alternation rate as the number of symbol changes divided by 12.
-                     5. Determine if an oscillation pattern exists: this is true when both the last run and the previous run are length 4 or greater and have opposite symbols.
-                     6. Determine dominance: the higher of the two proportions.
-                     7. Determine imbalance: the absolute difference between p_T and 0.5.
+    private final String apiKey;
+    private final HttpClient http;
 
-                     SCORING RULES
-                     Maintain three scores: anti-run, follow, and skip. Apply the following adjustments:
-
-                     - If an oscillation pattern is detected, increase anti-run score by 2.
-                     - If the last run length is 5 or more and the previous run length is 2 or less, increase anti-run score by 1.
-                     - If the last run length is 5 or more and not oscillation, increase skip score by 1.
-                     - If the last run length is between 1 and 3 and the dominant side has proportion at least 0.6, increase follow score by 1.
-                     - If alternation rate is greater than or equal to 0.7, increase skip score by 2.
-                     - If dominance is at least 0.65, increase follow score by 1.
-
-                     DECISION RULES
-                     - If anti-run score is strictly higher than both follow and skip, then pick the opposite of the last run symbol.
-                     - Else if follow score is strictly higher than both anti-run and skip, then pick the last run symbol or the majority side.
-                     - Else if skip score is highest, or there is a tie between categories, output SKIP.
-
-                     OUTPUT FORMAT
-                     Always respond with strict JSON:
-                     {
-                       "pick": "T" | "X" | "S",
-                       "signals": {
-                         "last_streak": integer,
-                         "prev_streak": integer,
-                         "p_T": float,
-                         "p_X": float,
-                         "alternation": float,
-                         "oscillation": true or false,
-                         "scores": {"anti-run": int, "follow": int, "skip": int}
-                       },
-                       "rationale": "no more than 20 words, concise, mechanical"
-                     }
-
-                     STYLE
-                     - Cold, technical, and emotionless.
-                     - Do not mention luck, feelings, money, or legality.
-                     - When no clear signal exists, prefer SKIP.
-
-                     This is my json: %s.
-                     """;
-
-    private final Map<String, String> cache = new ConcurrentHashMap<>();
+    public LLM() {
+        String key = "AIzaSyCSeJkWCGwwX-BABEMS7yYpkVSZMBqhJ-U";
+        if (key == null || key.isBlank()) {
+            // Bạn có thể đổi thành hardcode nếu muốn, nhưng nên dùng env var
+            throw new IllegalStateException("Missing GEMINI_API_KEY environment variable");
+        }
+        this.apiKey = key;
+        this.http = HttpClient.newBuilder()
+                .connectTimeout(CONNECT_TIMEOUT)
+                .build();
+    }
 
     public String getAnswer(String inputJson) {
-        return cache.computeIfAbsent(inputJson, key -> {
-            String content = String.format(CONTEXT, key);
-            GenerateContentResponse response = CLIENT.models.generateContent("gemini-2.5-flash", content, null);
-            return response.text();
-        });
+        try {
+            String prompt = buildPrompt(inputJson);
+            String payload = buildRequestPayload(prompt);
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(ENDPOINT + apiKey))
+                    .timeout(CALL_TIMEOUT)
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .POST(HttpRequest.BodyPublishers.ofString(payload))
+                    .build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            String body = resp.body();
+
+            // Trích text ứng viên đầu tiên: candidates[0].content.parts[0].text
+            // Với response_mime_type=application/json, phần text này CHÍNH LÀ JSON output.
+            String text = extractFirstText(body);
+            if (text == null || text.isBlank()) {
+                // Fallback cứng: trả SKIP, kèm thông tin để debug
+                return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"Empty LLM text\"}";
+            }
+            return text.trim();
+        } catch (HttpTimeoutException te) {
+            return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"LLM timeout\"}";
+        } catch (Exception e) {
+            return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"LLM error: " + escapeForJson(e.getMessage()) + "\"}";
+        }
     }
+
+    // ===== Prompt “ưu việt” (giảm SKIP, ép JSON) =====
+    private String buildPrompt(String inputJson) {
+        return """
+ROLE
+You are a cold, rational analyst for a dice-based Tài/Xỉu game (possibly manipulated).
+Input: exactly 13 most recent results, "T" = Tài, "X" = Xỉu. 
+Output: one of {TAI, XIU, SKIP} with rationale.
+
+INPUT
+%s
+
+STEP 1: Compute features
+- last_streak = (sym, len)
+- prev_streak = (sym, len)
+- p_T, p_X = proportions in 13
+- alternation = flips / 12
+- oscillation = true if last.len ≥4 and prev.len ≥4 and sym ≠ prev.sym
+- dominance = max(p_T, p_X)
+- imbalance = |p_T - 0.5|
+
+STEP 2: Score scenarios
+- Oscillation pattern → Score(anti-run) +2
+- Overextended (last.len ≥5):
+    - If prev.len ≤2 → Score(anti-run) +1
+    - Else → Score(skip) +1
+- Short run (last.len 1–3) AND dominance ≥0.6 → Score(follow) +1
+- Alternation ≥0.7 → Score(skip) +2
+- dominance ≥0.65 → Score(follow majority) +1
+
+STEP 3: Decision
+- Compare scores:
+    - If anti-run highest → pick opposite of last_streak.sym
+    - Else if follow highest → pick last_streak.sym or majority side
+    - If tie or skip highest → SKIP
+
+OUTPUT FORMAT
+{
+  "pick": "T" | "X" | "S",
+  "signals": {
+    "last_streak": int,
+    "prev_streak": int,
+    "p_T": float,
+    "p_X": float,
+    "alternation": float,
+    "oscillation": true|false,
+    "scores": {"anti-run": int, "follow": int, "skip": int}
+  },
+  "rationale": "≤20 words, cold, mechanical"
 }
 
+STYLE
+- Never emotional, never talk about money.
+- If no clear edge then SKIP.
+""".formatted(inputJson);
+    }
+
+    private String buildRequestPayload(String prompt) {
+        String escaped = escapeForJson(prompt);
+        return """
+        {
+          "contents": [
+            {
+              "parts": [
+                { "text": "%s" }
+              ]
+            }
+          ],
+          "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.1,
+            "maxOutputTokens": 256,
+            "topK": 40,
+            "topP": 0.8
+          }
+        }
+        """.formatted(escaped);
+    }
+
+    // ===== Helpers =====
+   
+    private String extractFirstText(String responseJson) {
+        if (responseJson == null) {
+            return null;
+        }
+
+        // Tìm khóa "text":
+        int key = responseJson.indexOf("\"text\"");
+        if (key < 0) {
+            return null;
+        }
+
+        // Tìm dấu ':' sau "text"
+        int colon = responseJson.indexOf(':', key + 6);
+        if (colon < 0) {
+            return null;
+        }
+
+        // Bỏ qua whitespace tới dấu quote mở
+        int i = colon + 1;
+        while (i < responseJson.length() && Character.isWhitespace(responseJson.charAt(i))) {
+            i++;
+        }
+        if (i >= responseJson.length() || responseJson.charAt(i) != '\"') {
+            return null;
+        }
+
+        // Đọc chuỗi JSON (có thể có escape) cho tới dấu quote đóng
+        int start = i + 1;
+        StringBuilder sb = new StringBuilder();
+        boolean escape = false;
+        for (int j = start; j < responseJson.length(); j++) {
+            char c = responseJson.charAt(j);
+            if (escape) {
+                // Xử lý các escape phổ biến
+                switch (c) {
+                    case 'n':
+                        sb.append('\n');
+                        break;
+                    case 'r':
+                        sb.append('\r');
+                        break;
+                    case 't':
+                        sb.append('\t');
+                        break;
+                    case '\"':
+                        sb.append('\"');
+                        break;
+                    case '\\':
+                        sb.append('\\');
+                        break;
+                    default:
+                        sb.append(c);
+                        break;
+                }
+                escape = false;
+                continue;
+            }
+            if (c == '\\') {
+                escape = true;
+                continue;
+            }
+            if (c == '\"') {
+                // Kết thúc chuỗi
+                return sb.toString();
+            }
+            sb.append(c);
+        }
+        return null; // không tìm thấy quote đóng hợp lệ
+    }
+
+    /**
+     * Escape chuỗi để nhét an toàn vào JSON (chỉ phần cần thiết).
+     */
+    private String escapeForJson(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+}

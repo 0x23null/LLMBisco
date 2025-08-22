@@ -2,7 +2,6 @@ controller\Bankroll$Actual.class
 controller\Statistic$Bankroll$Actual.class
 controller\Statistic$Bankroll$Pred.class
 controller\DotScannerService.class
-controller\StatisticDummy.class
 model\LLM.class
 controller\Bankroll.class
 controller\Statistic$Actual.class
