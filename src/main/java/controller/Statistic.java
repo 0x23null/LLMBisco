@@ -139,7 +139,6 @@ public class Statistic {
             // Không đổi round → heartbeat / stall warn
             heartbeat();
         }
-        }
         printSummary();
     }
 
