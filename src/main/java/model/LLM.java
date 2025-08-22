@@ -15,7 +15,7 @@ public class LLM {
             + MODEL + ":generateContent?key=";
 
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(8);
-    private static final Duration CALL_TIMEOUT = Duration.ofSeconds(12);
+    private static final Duration CALL_TIMEOUT = Duration.ofSeconds(20);
 
     private final String apiKey;
     private final HttpClient http;
@@ -51,13 +51,15 @@ public class LLM {
             // Với response_mime_type=application/json, phần text này CHÍNH LÀ JSON output.
             String text = extractFirstText(body);
             if (text == null || text.isBlank()) {
-                // Fallback cứng: trả SKIP, kèm thông tin để debug
-                return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"Empty LLM text\"}";
+                System.err.println("[ERR ] LLM response text is empty or null.");
+                //return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"Empty LLM text\"}";
             }
             return text.trim();
         } catch (HttpTimeoutException te) {
+            System.err.println("[ERR ] LLM HTTP timeout: " + te.getMessage());
             return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"LLM timeout\"}";
         } catch (Exception e) {
+            System.err.println("[ERR ] LLM general error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return "{\"pick\":\"SKIP\",\"signals\":{},\"rationale\":\"LLM error: " + escapeForJson(e.getMessage()) + "\"}";
         }
     }
@@ -65,56 +67,56 @@ public class LLM {
     // ===== Prompt “ưu việt” (giảm SKIP, ép JSON) =====
     private String buildPrompt(String inputJson) {
         return """
-ROLE
-You are a cold, rational analyst for a dice-based Tài/Xỉu game (possibly manipulated).
-Input: exactly 13 most recent results, "T" = Tài, "X" = Xỉu. 
-Output: one of {TAI, XIU, SKIP} with rationale.
+                ROLE
+                You are a cold, rational analyst for a dice-based Tài/Xỉu game (possibly manipulated).
+                Input: exactly 13 most recent results, "T" = Tài, "X" = Xỉu. 
+                Output: one of {TAI, XIU, SKIP} with rationale.
 
-INPUT
-%s
+                INPUT
+                %s
 
-STEP 1: Compute features
-- last_streak = (sym, len)
-- prev_streak = (sym, len)
-- p_T, p_X = proportions in 13
-- alternation = flips / 12
-- oscillation = true if last.len ≥4 and prev.len ≥4 and sym ≠ prev.sym
-- dominance = max(p_T, p_X)
-- imbalance = |p_T - 0.5|
+                STEP 1: Compute features
+                - last_streak = (sym, len)
+                - prev_streak = (sym, len)
+                - p_T, p_X = proportions in 13
+                - alternation = flips / 12
+                - oscillation = true if last.len ≥4 and prev.len ≥4 and sym ≠ prev.sym
+                - dominance = max(p_T, p_X)
+                - imbalance = |p_T - 0.5|
 
-STEP 2: Score scenarios
-- Oscillation pattern → Score(anti-run) +2
-- Overextended (last.len ≥5):
-    - If prev.len ≤2 → Score(anti-run) +1
-    - Else → Score(skip) +1
-- Short run (last.len 1–3) AND dominance ≥0.6 → Score(follow) +1
-- Alternation ≥0.7 → Score(skip) +2
-- dominance ≥0.65 → Score(follow majority) +1
+                STEP 2: Score scenarios
+                - Oscillation pattern → Score(anti-run) +2
+                - Overextended (last.len ≥5):
+                    - If prev.len ≤2 → Score(anti-run) +1
+                    - Else → Score(skip) +1
+                - Short run (last.len 1–3) AND dominance ≥0.6 → Score(follow) +1
+                - Alternation ≥0.7 → Score(skip) +2
+                - dominance ≥0.65 → Score(follow majority) +1
 
-STEP 3: Decision
-- Compare scores:
-    - If anti-run highest → pick opposite of last_streak.sym
-    - Else if follow highest → pick last_streak.sym or majority side
-    - If tie or skip highest → SKIP
+                STEP 3: Decision
+                - Compare scores:
+                    - If anti-run highest → pick opposite of last_streak.sym
+                    - Else if follow highest → pick last_streak.sym or majority side
+                    - If tie or skip highest → SKIP
 
-OUTPUT FORMAT
-{
-  "pick": "T" | "X" | "S",
-  "signals": {
-    "last_streak": int,
-    "prev_streak": int,
-    "p_T": float,
-    "p_X": float,
-    "alternation": float,
-    "oscillation": true|false,
-    "scores": {"anti-run": int, "follow": int, "skip": int}
-  },
-  "rationale": "≤20 words, cold, mechanical"
-}
+                OUTPUT FORMAT
+                {
+                  "pick": "T" | "X" | "S",
+                  "signals": {
+                    "last_streak": int,
+                    "prev_streak": int,
+                    "p_T": float,
+                    "p_X": float,
+                    "alternation": float,
+                    "oscillation": true|false,
+                    "scores": {"anti-run": int, "follow": int, "skip": int}
+                  },
+                  "rationale": "≤20 words, cold, mechanical"
+                }
 
-STYLE
-- Never emotional, never talk about money.
-- If no clear edge then SKIP.
+                STYLE
+                - Never emotional, never talk about money.
+                - If no clear edge then SKIP.
 """.formatted(inputJson);
     }
 
