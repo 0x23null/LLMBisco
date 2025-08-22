@@ -36,10 +36,8 @@ public class Statistic {
     private int settledRounds = 0;   // số ván đã settle (đã có actual)
     private int correctOnBets = 0;   // số đúng trong các ván CÓ đặt (bỏ qua SKIP)
 
-    // confusion
-    private int pTAI_aT = 0, pTAI_aX = 0;
-    private int pXIU_aX = 0, pXIU_aT = 0;
-    private int pSKIP_aT = 0, pSKIP_aX = 0;
+    // confusion[pred][actual]
+    private final int[][] confusion = new int[Pred.values().length][Actual.values().length];
 
     private final DateTimeFormatter tsFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final Pattern PICK_RE = Pattern.compile("\"pick\"\\s*:\\s*\"\\s*(TAI|XIU|SKIP)\\s*\"", Pattern.CASE_INSENSITIVE);
@@ -100,29 +98,10 @@ public class Statistic {
 
     private void settleAndReport(String history, Pred pred, Actual actual) {
         // confusion + correct
-        switch (pred) {
-            case TAI -> {
-                if (actual == Actual.T) {
-                    pTAI_aT++;
-                    correctOnBets++;
-                } else {
-                    pTAI_aX++;
-                }
-            }
-            case XIU -> {
-                if (actual == Actual.X) {
-                    pXIU_aX++;
-                    correctOnBets++;
-                } else {
-                    pXIU_aT++;
-                }
-            }
-            case SKIP -> {
-                if (actual == Actual.T) {
-                    pSKIP_aT++;
-                } else {
-                    pSKIP_aX++;
-                }
+        confusion[pred.ordinal()][actual.ordinal()]++;
+        if (pred != Pred.SKIP) {
+            if ((pred == Pred.TAI && actual == Actual.T) || (pred == Pred.XIU && actual == Actual.X)) {
+                correctOnBets++;
             }
         }
 
@@ -141,7 +120,12 @@ public class Statistic {
 
         if (settledRounds % 10 == 0) {
             System.out.printf("Confusion: TAI->T:%d TAI->X:%d | XIU->X:%d XIU->T:%d | SKIP->T:%d SKIP->X:%d%n",
-                    pTAI_aT, pTAI_aX, pXIU_aX, pXIU_aT, pSKIP_aT, pSKIP_aX);
+                    confusion[Pred.TAI.ordinal()][Actual.T.ordinal()],
+                    confusion[Pred.TAI.ordinal()][Actual.X.ordinal()],
+                    confusion[Pred.XIU.ordinal()][Actual.X.ordinal()],
+                    confusion[Pred.XIU.ordinal()][Actual.T.ordinal()],
+                    confusion[Pred.SKIP.ordinal()][Actual.T.ordinal()],
+                    confusion[Pred.SKIP.ordinal()][Actual.X.ordinal()]);
         }
     }
 
